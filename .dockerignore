@@ -1,0 +1,23 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.swp
+*.DS_Store
+
+# Large local data files should not be sent to build context
+*.xlsx
+*.xls
+renivon/
+renivon oud/
+renivon.zip
+
+# IDE
+.vscode
+.idea
+
