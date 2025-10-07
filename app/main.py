@@ -1,28 +1,27 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from pathlib import Path
-import shutil
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from typing import Optional
+from io import BytesIO
 
-# Import the existing lambda entrypoint
-from excel_processor import lambda_handler
+# Import bytes-based processor
+from excel_processor import process_excel_bytes
 
 app = FastAPI(title="Media Point Excel Processor")
 
-DATA_DIR = Path("/data")
-INPUT_FILE = DATA_DIR / "Bron.xlsx"
-OUTPUT_FILE = DATA_DIR / "Modified_Bron.xlsx"
-UPLOADED_FLAG = DATA_DIR / ".uploaded"
-PROCESSED_FLAG = DATA_DIR / ".processed"
+# In-memory buffers and simple timestamps
+UPLOAD_BUFFER: Optional[bytes] = None
+OUTPUT_BUFFER: Optional[bytes] = None
+UPLOADED_AT: Optional[float] = None
+PROCESSED_AT: Optional[float] = None
 
 
-def cleanup_files():
-    for path in (INPUT_FILE, OUTPUT_FILE, UPLOADED_FLAG, PROCESSED_FLAG):
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
+def cleanup_memory():
+    global UPLOAD_BUFFER, OUTPUT_BUFFER, UPLOADED_AT, PROCESSED_AT
+    UPLOAD_BUFFER = None
+    OUTPUT_BUFFER = None
+    UPLOADED_AT = None
+    PROCESSED_AT = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -138,64 +137,56 @@ def read_root():
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with INPUT_FILE.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    # update workflow flags
-    try:
-        if PROCESSED_FLAG.exists():
-            PROCESSED_FLAG.unlink()
-    except Exception:
-        pass
-    UPLOADED_FLAG.touch()
-
-    return JSONResponse({"message": "Upload successful", "path": str(INPUT_FILE)})
+    global UPLOAD_BUFFER, OUTPUT_BUFFER, UPLOADED_AT, PROCESSED_AT
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    UPLOAD_BUFFER = data
+    UPLOADED_AT = __import__("time").time()
+    # Reset processed state on new upload
+    OUTPUT_BUFFER = None
+    PROCESSED_AT = None
+    return JSONResponse({"message": "Upload successful"})
 
 
 @app.post("/run")
 def run_processing():
-    if not UPLOADED_FLAG.exists():
+    global UPLOAD_BUFFER, OUTPUT_BUFFER, PROCESSED_AT
+    if UPLOAD_BUFFER is None:
         raise HTTPException(status_code=400, detail="Please upload Bron.xlsx first.")
-
-    # Call the existing lambda handler which is adapted to use local files
-    result = lambda_handler(event={}, context=None)
-    status_code = result.get("statusCode", 500)
-    body = result.get("body", "Unknown error")
-    if status_code == 200 and OUTPUT_FILE.exists():
-        PROCESSED_FLAG.touch()
-    return JSONResponse(status_code=status_code, content={"message": body})
+    try:
+        output_bytes = process_excel_bytes(UPLOAD_BUFFER)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+    OUTPUT_BUFFER = output_bytes
+    PROCESSED_AT = __import__("time").time()
+    return JSONResponse(
+        status_code=200, content={"message": "File processed successfully."}
+    )
 
 
 @app.get("/download")
 def download_output():
-    # Only allow download if processed is newer than uploaded and file exists
-    processed_ok = (
-        OUTPUT_FILE.exists()
-        and PROCESSED_FLAG.exists()
-        and UPLOADED_FLAG.exists()
-        and PROCESSED_FLAG.stat().st_mtime >= UPLOADED_FLAG.stat().st_mtime
-    )
-    if not processed_ok:
+    if OUTPUT_BUFFER is None:
         raise HTTPException(
             status_code=404,
             detail="Modified_Bron.xlsx not found. Run the processor first.",
         )
-    return FileResponse(
-        path=str(OUTPUT_FILE),
+    background = BackgroundTask(cleanup_memory)
+    return StreamingResponse(
+        BytesIO(OUTPUT_BUFFER),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="Modified_Bron.xlsx",
-        background=BackgroundTask(cleanup_files),
+        headers={"Content-Disposition": "attachment; filename=Modified_Bron.xlsx"},
+        background=background,
     )
 
 
 @app.get("/status")
 def status():
-    uploaded = UPLOADED_FLAG.exists() and INPUT_FILE.exists()
+    uploaded = UPLOAD_BUFFER is not None
     processed = (
-        OUTPUT_FILE.exists()
-        and PROCESSED_FLAG.exists()
-        and UPLOADED_FLAG.exists()
-        and PROCESSED_FLAG.stat().st_mtime >= UPLOADED_FLAG.stat().st_mtime
+        OUTPUT_BUFFER is not None
+        and uploaded
+        and ((PROCESSED_AT or 0) >= (UPLOADED_AT or 0))
     )
     return JSONResponse({"uploaded": uploaded, "processed": processed})
